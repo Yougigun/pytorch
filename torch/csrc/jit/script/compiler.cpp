@@ -1,4 +1,3 @@
-#include <torch/csrc/jit/script/compiler.h>
 #include <c10/util/Exception.h>
 #include <torch/csrc/jit/hooks_for_testing.h>
 #include <torch/csrc/jit/interpreter.h>
@@ -6,6 +5,7 @@
 #include <torch/csrc/jit/operator.h>
 #include <torch/csrc/jit/passes/constant_pooling.h>
 #include <torch/csrc/jit/passes/lower_tuples.h>
+#include <torch/csrc/jit/script/compiler.h>
 #include <torch/csrc/jit/script/final_returns.h>
 #include <torch/csrc/jit/script/parser.h>
 #include <torch/csrc/jit/script/schema_matching.h>
@@ -311,10 +311,10 @@ struct Environment {
   }
 
   void setVar(const SourceRange& loc, const std::string& name, Value* value) {
-    setSugaredVar(loc, name, std::make_shared<SimpleValue>(value));
+    setVar(loc, name, std::make_shared<SimpleValue>(value));
   }
 
-  void setSugaredVar(
+  void setVar(
       const SourceRange& loc,
       const std::string& name,
       SugaredValuePtr value) {
@@ -575,6 +575,7 @@ struct to_ir {
       const SugaredValuePtr& self,
       Block* block) {
     auto schema = extractSchemaFromDef(def, self);
+    // TODO need guards on init returning none
     if (schema.returns().size() == 1) {
       def_stack_.back().declared_return_type_ = schema.returns().at(0).type();
     }
@@ -629,8 +630,9 @@ struct to_ir {
       const SugaredValuePtr& self) {
     auto params_begin = decl.params().begin();
     auto params_end = decl.params().end();
-    if (self)
+    if (self && !dynamic_cast<UserTypeValue*>(self.get())) {
       ++params_begin;
+    }
     std::vector<Argument> retval;
 
     std::vector<Expr> default_types;
@@ -699,7 +701,7 @@ struct to_ir {
   FunctionSchema extractSchemaFromDef(
       const Def& def,
       const SugaredValuePtr& self) {
-    auto name = def.name().name();
+    const auto name = def.name().name();
     std::vector<Argument> args = parseArgsFromDecl(def.decl(), self);
     std::vector<Argument> returns = parseReturnFromDecl(def.decl());
     return FunctionSchema(
@@ -715,21 +717,42 @@ struct to_ir {
     // inputs
     auto it = def.decl().params().begin();
     auto end = def.decl().params().end();
-    auto expected_annotation_size =
-        self ? def.decl().params().size() - 1 : def.decl().params().size();
+    auto userType = dynamic_cast<UserTypeValue*>(self.get());
+    auto expected_annotation_size = def.decl().params().size();
+    if (self && !userType) {
+      expected_annotation_size--;
+    }
     if (schema.arguments().size() != expected_annotation_size) {
+      AT_ASSERT(false);
       throw ErrorReport(def.decl().params().range())
           << "Number of type annotations for"
           << " function parameters (" << schema.arguments().size() << ")"
           << " does not match the number of parameters on the function ("
           << expected_annotation_size << ")!";
     }
+    // TODO figure out what to do here. We want to do:
+    // 1. If `self` is "first class", e.g. it's a user-defined type, treat it
+    // like normal arguments
+    // 2. Otherwise, it's a
+    size_t arg_annotation_idx = 0;
     if (self) {
       AT_ASSERT(it != end);
-      environment_stack->setSugaredVar(def.range(), (*it).ident().name(), self);
+      const auto& name = (*it).ident().name();
+      environment_stack->setVar(def.range(), name, self);
+      // TODO If this is a first-class type, we also need to bind "self" to a
+      // block input
+      if (userType) {
+        Value* new_input = block->addInput();
+        if (meaningfulName(name)) {
+          new_input->setUniqueName(name);
+        }
+
+        userType->value_ = new_input;
+        arguments.push_back(schema.arguments().at(arg_annotation_idx++));
+        new_input->setType(arguments.back().type());
+      }
       ++it;
     }
-    size_t arg_annotation_idx = 0;
     for (; it != end; ++it) {
       auto& name = (*it).ident().name();
       // Add the input to the graph
@@ -1390,7 +1413,7 @@ struct to_ir {
     const std::string& target_name = target.name();
     pushFrame(environment_stack->block());
     for (const auto& inst : instances) {
-      environment_stack->setSugaredVar(itrs[0].range(), target_name, inst);
+      environment_stack->setVar(itrs[0].range(), target_name, inst);
       emitStatements(body);
     }
 
@@ -1767,7 +1790,7 @@ struct to_ir {
           i++;
           break;
         case TK_VAR:
-          environment_stack->setSugaredVar(
+          environment_stack->setVar(
               assignee.range(), Var(assignee).name().name(), outputs.at(i));
           i++;
           break;
@@ -1799,11 +1822,14 @@ struct to_ir {
     switch (stmt.lhs().kind()) {
       case TK_VAR: {
         auto v = Var(stmt.lhs());
-        environment_stack->setSugaredVar(
+        environment_stack->setVar(
             v.range(), v.name().name(), emitSugaredExpr(stmt.rhs(), 1));
       } break;
       case TK_TUPLE_LITERAL:
         emitTupleAssign(TupleLiteral(stmt.lhs()), stmt.rhs());
+        break;
+      case '.':
+        emitSelectAssign(stmt);
         break;
       case TK_SUBSCRIPT:
         emitSubscriptAssign(stmt.range(), Subscript(stmt.lhs()), stmt.rhs());
@@ -1812,6 +1838,15 @@ struct to_ir {
         throw ErrorReport(stmt.lhs())
             << "unexpected expression on left-hand side of assignment.";
     }
+  }
+
+  void emitSelectAssign(const Assign& stmt) {
+    const auto lhs = Select(stmt.lhs());
+    const auto basename = Var(lhs.value()).name();
+    const auto rhsValue =
+        emitSugaredExpr(stmt.rhs(), 1)->asValue(stmt.rhs().range(), method);
+    auto userObject = environment_stack->getSugaredVar(basename);
+    userObject->assign(stmt.range(), method, lhs.selector().name(), rhsValue);
   }
 
   NodeKind getNodeKind(int kind, int ninputs) {
@@ -2669,6 +2704,25 @@ void defineMethodsInModule(
     resolvers.push_back(resolver);
   }
   defineMethodsInModule(m, definitions, resolvers, self);
+}
+
+void defineUserType(
+    const ClassDef& classDef,
+    const Resolver& resolver,
+    const std::shared_ptr<UserTypeValue>& self) {
+  const auto defs = classDef.defs();
+  for (auto it = defs.begin(); it != defs.end(); ++it) {
+    auto def = *it;
+    if (def.name().name() == "__init__") {
+      // TODO explain
+      self->assignmentsShouldDefine_ = true;
+    }
+    auto creator = [&](Method& method) { to_ir(def, resolver, self, method); };
+    Method& m =
+        self->type_->module()->create_method(def.name().name(), creator);
+    m.ensure_defined();
+    self->assignmentsShouldDefine_ = false;
+  }
 }
 
 void lambdaLiftFork(Node* fork_node) {

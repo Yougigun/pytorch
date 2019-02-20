@@ -39,6 +39,16 @@ struct SugaredValue : public std::enable_shared_from_this<SugaredValue> {
       const std::string& field) {
     throw ErrorReport(loc) << "attribute lookup is not defined on " << kind();
   }
+
+  // assign an attribute on it, e.g. `this.field = newValue`
+  virtual void assign(
+      const SourceRange& loc,
+      Method& m,
+      const std::string& field,
+      Value* newValue) {
+    throw ErrorReport(loc) << "attribute assignment is not defined on "
+                           << kind();
+  }
   virtual NoneStatus isNone() {
     return NEVER;
   }
@@ -159,10 +169,14 @@ struct TORCH_API BuiltinModule : public SugaredValue {
 
 // defines how a method obtained from a module behaves in script
 struct MethodValue : public SugaredValue {
-  MethodValue(std::shared_ptr<Module> module, Method& method)
-      : module(std::move(module)) // insurance that method stays alive
-        ,
-        method(method) {}
+  MethodValue(
+      std::shared_ptr<Module> module,
+      Method& method,
+      // TODO this is factored wrong
+      c10::optional<NamedValue> self = c10::nullopt)
+      : module(std::move(module)), // insurance that method stays alive
+        method(method),
+        self_(self) {}
   std::string kind() const override {
     return "method";
   }
@@ -173,12 +187,13 @@ struct MethodValue : public SugaredValue {
       at::ArrayRef<NamedValue> attributes,
       size_t n_binders) override {
     return std::make_shared<SimpleValue>(
-        caller.emit_call_to(loc, method, inputs, attributes));
+        caller.emit_call_to(loc, method, self_, inputs, attributes));
   }
 
  private:
   std::shared_ptr<Module> module;
   Method& method;
+  c10::optional<NamedValue> self_;
 };
 
 struct TORCH_API PrintValue : public SugaredValue {
@@ -216,6 +231,106 @@ struct TORCH_API CastValue : public BuiltinFunction {
 
  private:
   TypePtr type_;
+};
+
+struct TORCH_API UserTypeValue : public SugaredValue {
+  UserTypeValue(UserTypePtr p) : type_(p) {}
+
+  void assign(
+      const SourceRange& loc,
+      Method& m,
+      const std::string& field,
+      Value* newValue) override {
+    auto expectedType = type_->getAttribute(field);
+    if (!expectedType) {
+      if (assignmentsShouldDefine_) {
+        type_->addAttribute(field, newValue->type());
+        expectedType = newValue->type();
+      } else {
+        throw ErrorReport(loc)
+            << "Tried to assign to nonexistent field " << field
+            << ". Did you forget to initialize it in __init__()?";
+      }
+    }
+
+    // Otherwise, this is just a simple assignment.
+    // Check type correctness
+    const auto newType = newValue->type();
+    if (!newType->isSubtypeOf(expectedType)) {
+      throw ErrorReport(loc)
+          << "Wrong type for member assignment. Expected "
+          << expectedType->str() << " but got " << newType->str();
+    }
+
+    // Emit
+    auto& g = *m.graph();
+    g.insertNode(g.createSetAttr(value_, field, newValue));
+  }
+
+  std::shared_ptr<SugaredValue> attr(
+      const SourceRange& loc,
+      Method& m,
+      const std::string& field) {
+    AT_ASSERT(value_);
+    if (auto method = type_->module()->find_method(field)) {
+      return std::make_shared<MethodValue>(
+          type_->module(), *method, NamedValue(loc, "self", value_));
+    }
+
+    auto& g = *m.graph();
+    auto n = g.insertNode(g.createGetAttr(value_, field));
+    return std::make_shared<SimpleValue>(n->output());
+  }
+
+  // call it like a function, e.g. `outputs = this(inputs)`
+  // In this case, this is a constructor call
+  std::shared_ptr<SugaredValue> call(
+      const SourceRange& loc,
+      Method& m,
+      // note: names for args will be 'argument 0', 'argument 1', etc..
+      at::ArrayRef<NamedValue> inputs,
+      at::ArrayRef<NamedValue> attributes,
+      size_t n_binders) override {
+    AT_ASSERT(n_binders == 1);
+
+    auto& g = *m.graph();
+    auto createNode = g.insertNode(g.createUserObject(type_));
+    value_ = createNode->output();
+
+    auto initMethod = type_->module()->find_method("__init__");
+    AT_ASSERT(initMethod);
+
+    // Add the user type as `self`
+    std::vector<NamedValue> inputsWithSelf;
+    inputsWithSelf.emplace_back(loc, "self", value_);
+    inputsWithSelf.insert(inputsWithSelf.end(), inputs.begin(), inputs.end());
+
+    // Call the init function
+    std::make_shared<MethodValue>(type_->module(), *initMethod)
+        ->call(loc, m, inputsWithSelf, attributes, n_binders);
+
+    // Return `self`
+    auto newObj = std::make_shared<UserTypeValue>(type_);
+    newObj->value_ = value_;
+    return newObj;
+  }
+
+  Value* asValue(const SourceRange& loc, Method& m) {
+    return value_;
+  }
+
+  std::string getName() const {
+    return type_->name();
+  }
+
+  std::string kind() const override {
+    return type_->str();
+  }
+
+  UserTypePtr type_;
+  Value* value_;
+  bool assignmentsShouldDefine_ = false;
+  ;
 };
 
 // These SugaredValues have special handling in the compiler because they
