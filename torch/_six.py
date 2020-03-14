@@ -21,10 +21,13 @@
 import itertools
 import sys
 import builtins
+import types
+import inspect
 
 
 PY2 = sys.version_info[0] == 2
 PY3 = sys.version_info[0] == 3
+PY37 = sys.version_info[0] == 3 and sys.version_info[1] == 7
 
 if PY2:
     inf = float('inf')
@@ -53,9 +56,9 @@ else:
 
 
 if PY2:
-    import Queue as queue
+    import Queue as queue  # noqa: F401
 else:
-    import queue
+    import queue  # noqa: F401
 
 
 def with_metaclass(meta, *bases):
@@ -80,7 +83,8 @@ else:
 
 if PY3:
     import builtins
-    exec_ = getattr(builtins, "exec")
+    # See https://github.com/PyCQA/flake8-bugbear/issues/64
+    exec_ = getattr(builtins, "exec")  # noqa: B009
 else:
     def exec_(_code_, _globs_=None, _locs_=None):
         """Execute code in a namespace."""
@@ -136,6 +140,13 @@ if PY2:
 elif PY3:
     import builtins
 
+if PY2:
+    import StringIO
+    StringIO = StringIO.StringIO
+elif PY3:
+    import io
+    StringIO = io.StringIO
+
 
 # The codes below is not copied from the six package, so the copyright
 # declaration at the beginning does not apply.
@@ -150,3 +161,11 @@ def istuple(obj):
     # by a pytorch operator.
     t = type(obj)
     return isinstance(obj, tuple) or t.__module__ == 'torch.return_types'
+
+def bind_method(fn, obj, obj_type):
+    if PY2:
+        if inspect.ismethod(fn):
+            fn = fn.__func__
+        return types.MethodType(fn, obj, obj_type)
+    else:
+        return types.MethodType(fn, obj)

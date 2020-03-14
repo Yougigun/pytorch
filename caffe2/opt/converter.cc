@@ -1,4 +1,5 @@
 #include <limits>
+#include <utility>
 
 #include "caffe2/core/logging.h"
 #include "caffe2/opt/converter.h"
@@ -140,7 +141,29 @@ class ConvConverter : public Converter {
   ~ConvConverter() override {}
 };
 
+class ConvTransposeConverter : public Converter {
+  std::unique_ptr<nom::repr::NeuralNetOperator> convertToNeuralNetOperator(
+      const OperatorDef& op) override {
+    std::unique_ptr<repr::NeuralNetOperator> nnOp;
+    auto argMap = getArgumentsFromOperator(op);
+    auto kernelShape = getKernelShape(argMap);
+    nnOp = util::make_unique<repr::ConvTranspose>(kernelShape);
+    auto c = dyn_cast<repr::ConvTranspose>(nnOp.get());
+
+    c->setStrides(getStrides(argMap));
+    c->setPads(getPads(argMap));
+    c->setGroup(getGroup(argMap));
+
+    return nnOp;
+  }
+  // Does not override default converter to OperatorDef
+
+  virtual ~ConvTransposeConverter() {}
+};
+
 REGISTER_CONVERTER(Conv, ConvConverter);
+
+REGISTER_CONVERTER(ConvTranspose, ConvTransposeConverter);
 
 TRIVIAL_CONVERTER(Relu);
 REGISTER_CONVERTER(Relu, ReluConverter);
@@ -319,7 +342,7 @@ repr::NNModule convertToNNModule(
   }
 
   /// \brief For the construction of the control flow graph we keep track
-  /// of a current basic block, which we split up as we come accross control
+  /// of a current basic block, which we split up as we come across control
   /// flow operations such as if and while.
   auto bbNode = cfg.createNamedFunction("main");
 
@@ -584,7 +607,7 @@ void injectDataEdgeIndicators(caffe2::NetDef* net) {
     caffe2::OperatorDef op;
     op.set_type("Export");
     op.add_input(output);
-    *net->add_op() = op;
+    *net->add_op() = std::move(op);
   }
   net->clear_external_input();
   net->clear_external_output();

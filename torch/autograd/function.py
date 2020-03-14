@@ -51,7 +51,8 @@ class _ContextMethodMixin(object):
         This will mark outputs as not requiring gradients, increasing the
         efficiency of backward computation. You still need to accept a gradient
         for each output in :meth:`~Function.backward`, but it's always going to
-        be ``None``.
+        be a zero tensor with the same shape as the shape of a corresponding
+        output.
 
         This is used e.g. for indices returned from a max :class:`Function`.
         """
@@ -93,14 +94,14 @@ class FunctionMeta(type):
                 has_static_forward = isinstance(forward, staticmethod) or isinstance(forward, classmethod)
                 break
 
-        setattr(cls, '_is_legacy', not has_static_forward)
+        cls._is_legacy = not has_static_forward
 
         # old-style functions
         if not has_static_forward:
             return super(FunctionMeta, cls).__init__(name, bases, attrs)
 
         backward_fn = type(name + 'Backward', (BackwardCFunction,), {'_forward_cls': cls})
-        setattr(cls, '_backward_cls', backward_fn)
+        cls._backward_cls = backward_fn
 
         return super(FunctionMeta, cls).__init__(name, bases, attrs)
 
@@ -120,8 +121,6 @@ class Function(with_metaclass(FunctionMeta, _C._FunctionBase, _ContextMethodMixi
     subclasses and defining new operations. This is a recommended way of
     extending torch.autograd.
 
-    Each function object is meant to be used only once (in the forward pass).
-
     Examples::
 
         >>> class Exp(Function):
@@ -136,10 +135,16 @@ class Function(with_metaclass(FunctionMeta, _C._FunctionBase, _ContextMethodMixi
         >>>     def backward(ctx, grad_output):
         >>>         result, = ctx.saved_tensors
         >>>         return grad_output * result
+        >>>
+        >>> #Use it by calling the apply method:
+        >>> output = Exp.apply(input)
     """
 
-    # only for backward compatibility
-    __call__ = _C._FunctionBase._do_forward
+    def __call__(self, *args, **kwargs):
+        raise RuntimeError(
+            "Legacy autograd function with non-static forward method is deprecated. "
+            "Please use new-style autograd function with static forward method. "
+            "(Example: https://pytorch.org/docs/stable/autograd.html#torch.autograd.Function)")
 
     # for the tracer
     is_traceable = False
@@ -156,7 +161,8 @@ class Function(with_metaclass(FunctionMeta, _C._FunctionBase, _ContextMethodMixi
         The context can be used to store tensors that can be then retrieved
         during the backward pass.
         """
-        raise NotImplementedError
+        raise NotImplementedError("You must implement the forward function for custom"
+                                  " autograd.Function.")
 
     @staticmethod
     def backward(ctx, *grad_outputs):
@@ -177,7 +183,8 @@ class Function(with_metaclass(FunctionMeta, _C._FunctionBase, _ContextMethodMixi
         first input to :func:`forward` needs gradient computated w.r.t. the
         output.
         """
-        raise NotImplementedError
+        raise NotImplementedError("You must implement the backward function for custom"
+                                  " autograd.Function.")
 
 
 def once_differentiable(fn):
@@ -253,7 +260,13 @@ def _nested_map(condition, fn, condition_msg=None):
         elif obj is None:
             return None
         elif isinstance(obj, (list, tuple)):
-            return type(obj)(_map(x) for x in obj)
+            mapped = (_map(x) for x in obj)
+            if hasattr(obj, '_fields'):
+                # obj is namedtuple
+                return type(obj)(*mapped)
+            return type(obj)(mapped)
+        elif isinstance(obj, dict):
+            return {x : _map(obj[x]) for x in obj}
         else:
             raise ValueError("Auto nesting doesn't know how to process "
                              "an input object of type " + torch.typename(obj) +
@@ -281,6 +294,11 @@ def _iter_filter(condition, allow_unknown=False, condition_msg=None,
             return
         elif isinstance(obj, (list, tuple)):
             for o in obj:
+                for var in _iter(o):
+                    yield var
+        elif isinstance(obj, dict):
+            # We only accept primitive key types, so we needn't inspect them
+            for o in obj.values():
                 for var in _iter(o):
                     yield var
         elif allow_unknown:

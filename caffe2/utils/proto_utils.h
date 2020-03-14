@@ -55,6 +55,7 @@ namespace TextFormat {
 inline bool ParseFromString(const string& spec, MessageLite* proto) {
   LOG(FATAL) << "If you are running lite version, you should not be "
              << "calling any text-format protobuffers.";
+  return false;
 }
 } // namespace TextFormat
 
@@ -269,7 +270,7 @@ class C10_EXPORT ArgumentHelper {
     if (arg_map_.at(name).has_s()) {
       CAFFE_ENFORCE(
           message.ParseFromString(arg_map_.at(name).s()),
-          "Faild to parse content from the string");
+          "Failed to parse content from the string");
     } else {
       VLOG(1) << "Return empty message for parameter " << name;
     }
@@ -283,7 +284,7 @@ class C10_EXPORT ArgumentHelper {
     for (int i = 0; i < messages.size(); ++i) {
       CAFFE_ENFORCE(
           messages[i].ParseFromString(arg_map_.at(name).strings(i)),
-          "Faild to parse content from the string");
+          "Failed to parse content from the string");
     }
     return messages;
   }
@@ -329,6 +330,14 @@ bool inline operator==(const DeviceOption& dl, const DeviceOption& dr) {
   return IsSameDevice(dl, dr);
 }
 
+// Given a net, modify the external inputs/outputs if necessary so that
+// the following conditions are met
+// - No duplicate external inputs
+// - No duplicate external outputs
+// - Going through list of ops in order, all op inputs must be outputs
+// from other ops, or registered as external inputs.
+// - All external outputs must be outputs of some operators.
+CAFFE2_API void cleanupExternalInputsAndOutputs(NetDef* net);
 
 } // namespace caffe2
 

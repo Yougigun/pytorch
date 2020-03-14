@@ -62,7 +62,7 @@ C10_DEFINE_string(
     "Report the conversion stage time to screen. "
     "The format of the string is <type>|<identifier>. "
     "The valid type is 'json'. "
-    "The valid identifier is nothing or an identifer that prefix every line");
+    "The valid identifier is nothing or an identifier that prefix every line");
 C10_DEFINE_string(
     scale,
     "-1,-1",
@@ -438,10 +438,10 @@ TensorProtos convertValues(std::string& file_name) {
 void observerConfig() {
   caffe2::ClearGlobalNetObservers();
   caffe2::AddGlobalNetObserverCreator([](caffe2::NetBase* subject) {
-    return caffe2::make_unique<caffe2::PerfNetObserver>(subject);
+    return std::make_unique<caffe2::PerfNetObserver>(subject);
   });
   caffe2::ObserverConfig::setReporter(
-      caffe2::make_unique<caffe2::NetObserverReporterPrint>());
+      std::make_unique<caffe2::NetObserverReporterPrint>());
 }
 
 bool backendCudaSet(const string& backend) {
@@ -462,16 +462,24 @@ bool backendCudaSet(const string& backend) {
 
 void setOperatorEngine(caffe2::NetDef* net_def, const string& backend) {
   if (backend != "builtin") {
-    string engine = backend == "nnpack"
-        ? "NNPACK"
-        : backend == "eigen" ? "EIGEN"
-                             : backend == "mkl" ? "MKLDNN"
-                                                : backend == "cuda"
-                    ? "CUDA"
-                    : backend == "dnnlowp" ? "DNNLOWP"
-                                           : backend == "dnnlowp_acc16"
-                            ? "DNNLOWP_ACC16"
-                            : backend == "default" ? "" : "NONE";
+    string engine;
+    if( backend == "nnpack" ) {
+      engine = "NNPACK";
+    } else if ( backend == "eigen" ) {
+      engine = "EIGEN";
+    } else if ( backend == "mkl" ) {
+      engine = "MKLDNN";
+    } else if ( backend == "cuda" ) {
+      engine = "CUDA";
+    } else if ( backend == "dnnlowp" ) {
+      engine = "DNNLOWP";
+    } else if ( backend == "dnnlowp_acc16" ) {
+      engine = "DNNLOWP_ACC16";
+    } else if ( backend == "default" ) {
+      engine = "";
+    } else {
+      engine = "NONE";
+    }
     CAFFE_ENFORCE(engine != "NONE", "Backend is not supported");
     for (int i = 0; i < net_def->op_size(); i++) {
       caffe2::OperatorDef* op_def = net_def->mutable_op(i);
@@ -493,7 +501,7 @@ void fillInputBlob(
     if (blob == nullptr) {
       blob = workspace->CreateBlob(tensor_kv.first);
     }
-    // todo: support gpu and make this function a tempalte
+    // todo: support gpu and make this function a template
     int protos_size = tensor_kv.second.protos_size();
     if (protos_size == 1 && iteration > 0) {
       // Do not override the input data if there is only one input data,

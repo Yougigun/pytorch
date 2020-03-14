@@ -1,5 +1,4 @@
 #include <c10/core/CPUAllocator.h>
-#include <c10/util/typeid.h>
 #include <c10/core/DeviceType.h>
 
 // TODO: rename flags to C10
@@ -53,13 +52,24 @@ void* alloc_cpu(size_t nbytes) {
 #elif defined(_MSC_VER)
   data = _aligned_malloc(nbytes, gAlignment);
 #else
-  CAFFE_ENFORCE_EQ(posix_memalign(&data, gAlignment, nbytes), 0);
+  int err = posix_memalign(&data, gAlignment, nbytes);
+  if (err != 0) {
+    CAFFE_THROW(
+        "DefaultCPUAllocator: can't allocate memory: you tried to allocate ",
+        nbytes,
+        " bytes. Error code ",
+        err,
+        " (",
+        strerror(err),
+        ")");
+  }
 #endif
 
   CAFFE_ENFORCE(
       data,
-      "DefaultCPUAllocator: not enough memory: you tried to allocate %dGB. Buy new RAM!",
-      nbytes / 1073741824);
+      "DefaultCPUAllocator: not enough memory: you tried to allocate ",
+      nbytes,
+      " bytes. Buy new RAM!");
 
   // move data to a thread's NUMA node
   NUMAMove(data, nbytes, GetCurrentNUMANode());
@@ -74,6 +84,14 @@ void* alloc_cpu(size_t nbytes) {
   }
 
   return data;
+}
+
+void free_cpu(void* data) {
+#ifdef _MSC_VER
+  _aligned_free(data);
+#else
+  free(data);
+#endif
 }
 
 // A virtual struct that is used to report C10's memory allocation and
@@ -99,32 +117,22 @@ struct C10_API DefaultCPUAllocator final : at::Allocator {
       getMemoryAllocationReporter().New(data, nbytes);
       return {data, data, &ReportAndDelete, at::Device(at::DeviceType::CPU)};
     }
-    return {data, data, &Delete, at::Device(at::DeviceType::CPU)};
+    return {data, data, &free_cpu, at::Device(at::DeviceType::CPU)};
   }
-
-#ifdef _MSC_VER
-  static void Delete(void* data) {
-    _aligned_free(data);
-  }
-#else
-  static void Delete(void* data) {
-    free(data);
-  }
-#endif
 
   static void ReportAndDelete(void* ptr) {
     if (!ptr) {
       return;
     }
     getMemoryAllocationReporter().Delete(ptr);
-    Delete(ptr);
+    free_cpu(ptr);
   }
 
   at::DeleterFnPtr raw_deleter() const override {
     if (FLAGS_caffe2_report_cpu_memory_usage) {
       return &ReportAndDelete;
     }
-    return &Delete;
+    return &free_cpu;
   }
 
  protected:

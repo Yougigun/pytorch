@@ -2,6 +2,9 @@
 #define TH_GENERIC_FILE "TH/generic/THBlas.cpp"
 #else
 
+#ifdef USE_FBGEMM
+#include "fbgemm/FbgemmI64.h"
+#endif // USE_FBGEMM
 
 #ifdef BLAS_F2C
 # define ffloat double
@@ -78,8 +81,18 @@ void THBlas_(scal)(int64_t n, scalar_t a, scalar_t *x, int64_t incx)
   if(n == 1)
     incx = 1;
 
+  // [NOTE: cpu_zero]
+  // at least on the following version of BLAS this does not folllow the same semantics
+  // when a == 0 and there exists a NaN in the input.  Namely, the non-BLAS code below results
+  // in a value of 0, whereas this results in a value of NaN.  This is problematic because a
+  // NaN in an output tensor needs to be zero'ed explicitly through a separate mechanism.
+  // At the ATen/TH binding layer, this was via "cpu_zero", which would zero out the output
+  // tensor.
+  // BLAS version:
+  // [conda] blas                      1.0                         mkl
+  // [conda] mkl                       2019.4                      243
 #if defined(USE_BLAS) && (defined(TH_REAL_IS_DOUBLE) || defined(TH_REAL_IS_FLOAT))
-  if( (n <= INT_MAX) && (incx <= INT_MAX) )
+  if( (n <= INT_MAX) && (incx <= INT_MAX) && (a != 0))
   {
     int i_n = (int)n;
     int i_incx = (int)incx;
@@ -195,7 +208,18 @@ scalar_t THBlas_(dot)(int64_t n, scalar_t *x, int64_t incx, scalar_t *y, int64_t
   }
 }
 
-void THBlas_(gemv)(char trans, int64_t m, int64_t n, scalar_t alpha, scalar_t *a, int64_t lda, scalar_t *x, int64_t incx, scalar_t beta, scalar_t *y, int64_t incy)
+void THBlas_(gemv)(
+  char trans,
+  int64_t m,
+  int64_t n,
+  scalar_t alpha,
+  scalar_t *a,
+  int64_t lda,
+  scalar_t *x,
+  int64_t incx,
+  scalar_t beta,
+  scalar_t *y,
+  int64_t incy)
 {
   if(n == 1)
     lda = m;
@@ -232,10 +256,10 @@ void THBlas_(gemv)(char trans, int64_t m, int64_t n, scalar_t alpha, scalar_t *a
         scalar_t *row_ = a+lda*i;
         for(j = 0; j < m; j++)
           sum += x[j*incx]*row_[j];
-	if (beta == 0)
-	  y[i*incy] = alpha*sum;
-	else
-	  y[i*incy] = beta*y[i*incy] + alpha*sum;
+          if (beta == 0)
+            y[i*incy] = alpha*sum;
+          else
+            y[i*incy] = beta*y[i*incy] + alpha*sum;
       }
     }
     else
@@ -254,7 +278,16 @@ void THBlas_(gemv)(char trans, int64_t m, int64_t n, scalar_t alpha, scalar_t *a
   }
 }
 
-void THBlas_(ger)(int64_t m, int64_t n, scalar_t alpha, scalar_t *x, int64_t incx, scalar_t *y, int64_t incy, scalar_t *a, int64_t lda)
+void THBlas_(ger)(
+  int64_t m,
+  int64_t n,
+  scalar_t alpha,
+  scalar_t *x,
+  int64_t incx,
+  scalar_t *y,
+  int64_t incy,
+  scalar_t *a,
+  int64_t lda)
 {
   if(n == 1)
     lda = m;
@@ -292,7 +325,20 @@ void THBlas_(ger)(int64_t m, int64_t n, scalar_t alpha, scalar_t *x, int64_t inc
   }
 }
 
-void THBlas_(gemm)(char transa, char transb, int64_t m, int64_t n, int64_t k, scalar_t alpha, scalar_t *a, int64_t lda, scalar_t *b, int64_t ldb, scalar_t beta, scalar_t *c, int64_t ldc)
+void THBlas_(gemm)(
+  char transa,
+  char transb,
+  int64_t m,
+  int64_t n,
+  int64_t k,
+  scalar_t alpha,
+  scalar_t *a,
+  int64_t lda,
+  scalar_t *b,
+  int64_t ldb,
+  scalar_t beta,
+  scalar_t *c,
+  int64_t ldc)
 {
   int transa_ = ((transa == 't') || (transa == 'T'));
   int transb_ = ((transb == 't') || (transb == 'T'));
@@ -324,14 +370,10 @@ void THBlas_(gemm)(char transa, char transb, int64_t m, int64_t n, int64_t k, sc
 
 #if defined(USE_BLAS) && (defined(TH_REAL_IS_DOUBLE) || defined(TH_REAL_IS_FLOAT))
   if( (m <= INT_MAX) && (n <= INT_MAX) && (k <= INT_MAX) &&
-      (lda <= INT_MAX) && (ldb <= INT_MAX) && (ldc <= INT_MAX) )
+      (lda <= INT_MAX) && (ldb <= INT_MAX) && (ldc <= INT_MAX) &&
+      (lda >= THMax(1, (transa_ ? k : m))) && (ldb >= THMax(1, (transb_ ? n : k))) &&
+      (ldc >= THMax(1, m)))
   {
-    THArgCheck(lda >= THMax(1, (transa_ ? k : m)), 8,
-      "lda should be at least max(1, %d), but have %d", (transa_ ? k : m), lda);
-    THArgCheck(ldb >= THMax(1, (transb_ ? n : k)), 10,
-      "ldb should be at least max(1, %d), but have %d", (transb_ ? n : k), ldb);
-    THArgCheck(ldc >= THMax(1, m), 13,
-      "ldc should be at least max(1, m=%d), but have %d", m, ldc);
     int i_m = (int)m;
     int i_n = (int)n;
     int i_k = (int)k;
@@ -347,30 +389,74 @@ void THBlas_(gemm)(char transa, char transb, int64_t m, int64_t n, int64_t k, sc
     return;
   }
 #endif
+
+#if defined(USE_FBGEMM) && defined(TH_REAL_IS_LONG)
+  if (alpha == 1 && (beta == 0 || beta == 1)) {
+    // In FBGEMM, we assume row-major ordering; However, here we assume the
+    // column-major ordering following the FORTRAN tradition in BLAS interface
+    // in this function: we can configure the layout (row/column-major ordering)
+    // of A and B by changing transa_ and transb_, but we cannot change the
+    // layout of C with this FORTRAN-style BLAS interface.
+    //
+    // The workaround is that we compute
+    // C^T (n x m) = B^T (n x k) * A^T (k x m) instead.
+    //
+    // In this way we view C^T as the row-major ordering when passing to FBGEMM.
+    fbgemm::cblas_gemm_i64_i64acc(
+        transb_ ? fbgemm::matrix_op_t::Transpose
+                : fbgemm::matrix_op_t::NoTranspose,
+        transa_ ? fbgemm::matrix_op_t::Transpose
+                : fbgemm::matrix_op_t::NoTranspose,
+        n,
+        m,
+        k,
+        b,
+        ldb,
+        a,
+        lda,
+        beta == 1,
+        c,
+        ldc);
+    return;
+  }
+#endif
+
   {
-    int64_t i, j, l;
     if(!transa_ && !transb_)
     {
-      scalar_t *a_ = a;
-      for(i = 0; i < m; i++)
-      {
-        scalar_t *b_ = b;
-        for(j = 0; j < n; j++)
-        {
-          scalar_t sum = 0;
-          for(l = 0; l < k; l++)
-            sum += a_[l*lda]*b_[l];
-          b_ += ldb;
-	  if (beta == 0)
-	    c[j*ldc+i] = alpha*sum;
-	  else
-	    c[j*ldc+i] = beta*c[j*ldc+i]+alpha*sum;
+      if (beta == 0) {
+        for (int64_t j = 0; j < n; j++) {
+          for (int64_t i = 0; i < m; i++) {
+            c[j * ldc + i] = 0;
+          }
         }
-        a_++;
+      }
+      else {
+        for (int64_t j = 0; j < n; j++) {
+          for (int64_t i = 0; i < m; i++) {
+            c[j * ldc + i] *= beta;
+          }
+        }
+      }
+      for (int64_t l = 0; l < k; l++) {
+        for (int64_t j = 0; j < n; j++) {
+          scalar_t val = b[l + j * ldb] * alpha;
+          int64_t i_m = m / 4;
+          for (int64_t i_i = 0; i_i < i_m; i_i++) {
+              c[j * ldc + i_i * 4 + 0] += a[i_i * 4 + 0 + l * lda] * val;
+              c[j * ldc + i_i * 4 + 1] += a[i_i * 4 + 1 + l * lda] * val;
+              c[j * ldc + i_i * 4 + 2] += a[i_i * 4 + 2 + l * lda] * val;
+              c[j * ldc + i_i * 4 + 3] += a[i_i * 4 + 3 + l * lda] * val;
+          }
+          int64_t i = i_m * 4;
+          for (; i < m; i++)
+              c[j * ldc + i] += a[i + l * lda] * val;
+        }
       }
     }
     else if(transa_ && !transb_)
     {
+      int64_t i, j, l;
       scalar_t *a_ = a;
       for(i = 0; i < m; i++)
       {
@@ -381,52 +467,73 @@ void THBlas_(gemm)(char transa, char transb, int64_t m, int64_t n, int64_t k, sc
           for(l = 0; l < k; l++)
             sum += a_[l]*b_[l];
           b_ += ldb;
-	  if (beta == 0)
-	    c[j*ldc+i] = alpha*sum;
-	  else
-	    c[j*ldc+i] = beta*c[j*ldc+i]+alpha*sum;
+          if (beta == 0)
+            c[j*ldc+i] = alpha*sum;
+          else
+            c[j*ldc+i] = beta*c[j*ldc+i]+alpha*sum;
         }
         a_ += lda;
       }
     }
     else if(!transa_ && transb_)
     {
-      scalar_t *a_ = a;
-      for(i = 0; i < m; i++)
-      {
-        scalar_t *b_ = b;
-        for(j = 0; j < n; j++)
-        {
-          scalar_t sum = 0;
-          for(l = 0; l < k; l++)
-            sum += a_[l*lda]*b_[l*ldb];
-          b_++;
-	  if (beta == 0)
-	    c[j*ldc+i] = alpha*sum;
-	  else
-	    c[j*ldc+i] = beta*c[j*ldc+i]+alpha*sum;
+      if (beta == 0) {
+        for (int64_t j = 0; j < n; j++) {
+          for (int64_t i = 0; i < m; i++) {
+            c[j * ldc + i] = 0;
+          }
         }
-        a_++;
+      }
+      else {
+        for (int64_t j = 0; j < n; j++) {
+          for (int64_t i = 0; i < m; i++) {
+            c[j * ldc + i] *= beta;
+          }
+        }
+      }
+      for (int64_t l = 0; l < k; l++) {
+        for (int64_t j = 0; j < n; j++) {
+          scalar_t val = b[j + l * ldb] * alpha;
+          int64_t i_m = m / 4;
+          for (int64_t i_i = 0; i_i < i_m; i_i++) {
+            c[j * ldc + i_i * 4 + 0] += a[i_i * 4 + 0 + l * lda] * val;
+            c[j * ldc + i_i * 4 + 1] += a[i_i * 4 + 1 + l * lda] * val;
+            c[j * ldc + i_i * 4 + 2] += a[i_i * 4 + 2 + l * lda] * val;
+            c[j * ldc + i_i * 4 + 3] += a[i_i * 4 + 3 + l * lda] * val;
+          }
+          int64_t i = i_m * 4;
+          for (; i < m; i++)
+            c[j * ldc + i] += a[i + l * lda] * val;
+        }
       }
     }
     else
     {
-      scalar_t *a_ = a;
-      for(i = 0; i < m; i++)
-      {
-        scalar_t *b_ = b;
-        for(j = 0; j < n; j++)
-        {
-          scalar_t sum = 0;
-          for(l = 0; l < k; l++)
-            sum += a_[l]*b_[l*ldb];
-          b_++;
-	  if (beta == 0)
-	    c[j*ldc+i] = alpha*sum;
-	  else
-	    c[j*ldc+i] = beta*c[j*ldc+i]+alpha*sum;
+      for (int64_t i = 0; i < m; i++) {
+        for (int64_t j = 0; j < n; j++) {
+          if (beta == 0)
+            c[j * ldc + i] = 0;
+          else
+            c[j * ldc + i] *= beta;
         }
-        a_ += lda;
+      }
+      for (int64_t i = 0; i < m; i++) {
+        for (int64_t j = 0; j < n; j++) {
+          int64_t l_k = k / 4;
+          for (int64_t l_l = 0; l_l < l_k; l_l++) {
+              c[j * ldc + i] += a[i * lda + l_l * 4 + 0] //
+                          * b[(l_l * 4 + 0) * ldb + j] * alpha;
+              c[j * ldc + i] += a[i * lda + l_l * 4 + 1] //
+                          * b[(l_l * 4 + 1) * ldb + j] * alpha;
+              c[j * ldc + i] += a[i * lda + l_l * 4 + 2] //
+                          * b[(l_l * 4 + 2) * ldb + j] * alpha;
+              c[j * ldc + i] += a[i * lda + l_l * 4 + 3] //
+                          * b[(l_l * 4 + 3) * ldb + j] * alpha;
+          }
+          int64_t l = l_k * 4;
+          for (; l < k; l++)
+              c[j * ldc + i] += a[i * lda + l] * b[l * ldb + j] * alpha;
+        }
       }
     }
   }
